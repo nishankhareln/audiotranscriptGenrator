@@ -1,0 +1,6 @@
+openai-whisper
+pandas
+pydub
+tqdm
+torch
+torchaudio
