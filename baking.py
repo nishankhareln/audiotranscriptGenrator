@@ -1,242 +1,133 @@
-"""
-Audio Splitter & Transcriber for TTS Fine-tuning
-Splits MP3 files into 7-10 second WAV segments and generates transcripts
-"""
-
 import os
-import json
+import torch
+import subprocess
+import shutil
+import multiprocessing
 from pathlib import Path
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 import whisper
-import torch
 from tqdm import tqdm
 
-class AudioProcessor:
-    def __init__(self, input_dir, output_dir, min_duration=7, max_duration=10):
-        """
-        Initialize the audio processor
-        
-        Args:
-            input_dir: Directory containing MP3 files
-            output_dir: Directory to save WAV segments and transcripts
-            min_duration: Minimum segment duration in seconds
-            max_duration: Maximum segment duration in seconds
-        """
-        self.input_dir = Path(input_dir)
+def process_chunk_on_gpu(task):
+    """Function to be run in parallel across GPUs"""
+    chunk_path, output_dir, gpu_id = task
+    chunk_stem = Path(chunk_path).stem
+    
+    # Using 'htdemucs_ft' for better music removal and 'shifts' for accuracy
+    cmd = [
+        "demucs", 
+        "--two-stems", "vocals", 
+        "-n", "htdemucs_ft", 
+        "--device", f"cuda:{gpu_id}", 
+        "--segment", "10",
+        "--shifts", "5",  # Increases quality significantly
+        str(chunk_path), 
+        "-o", str(output_dir)
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+    return output_dir / "htdemucs_ft" / chunk_stem / "vocals.wav"
+
+class NaturalAIProcessor:
+    def __init__(self, input_file, output_dir, min_dur=2, max_dur=10):
+        self.input_path = Path(input_file)
         self.output_dir = Path(output_dir)
-        self.min_duration = min_duration * 1000  # Convert to milliseconds
-        self.max_duration = max_duration * 1000
+        self.wav_dir = self.output_dir / "wavs1"
+        self.min_dur = min_dur * 1000 
+        self.max_dur = max_dur * 1000 
+        self.padding = 300 
         
-        # Create output directories
-        self.wav_dir = self.output_dir / "wavs"
+        if self.output_dir.exists():
+            shutil.rmtree(self.output_dir)
         self.wav_dir.mkdir(parents=True, exist_ok=True)
         
-        # Load Whisper model
-        print("Loading Whisper model...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = whisper.load_model("base", device=device)
-        print(f"Using device: {device}")
+        self.num_gpus = torch.cuda.device_count()
+        print(f"🚀 Detected {self.num_gpus} GPUs. Using all for parallel processing.")
         
-    def split_audio(self, audio_file):
-        """
-        Split audio file into segments of 7-10 seconds
-        """
-        print(f"\nProcessing: {audio_file.name}")
-        audio = AudioSegment.from_file(str(audio_file))
-        
-        segments = []
-        file_base_name = audio_file.stem
-        
-        # Detect non-silent chunks
-        nonsilent_ranges = detect_nonsilent(
-            audio,
-            min_silence_len=500,  # 500ms of silence
-            silence_thresh=-40    # dB threshold
-        )
-        
-        if not nonsilent_ranges:
-            # If no silence detected, split by fixed duration
-            nonsilent_ranges = [(i, min(i + self.max_duration, len(audio))) 
-                               for i in range(0, len(audio), self.max_duration)]
-        
-        # Merge small chunks into optimal segments
-        current_start = nonsilent_ranges[0][0]
-        
-        for i, (start, end) in enumerate(nonsilent_ranges):
-            duration = end - current_start
-            
-            # If we've reached optimal duration or last chunk
-            if duration >= self.min_duration or i == len(nonsilent_ranges) - 1:
-                # Cap at max duration
-                if duration > self.max_duration:
-                    end = current_start + self.max_duration
-                
-                segments.append((current_start, end))
-                
-                # Start next segment
-                if i < len(nonsilent_ranges) - 1:
-                    current_start = nonsilent_ranges[i + 1][0]
-        
-        # Export segments
-        segment_files = []
-        for idx, (start, end) in enumerate(segments):
-            segment = audio[start:end]
-            
-            # Convert to mono, 22050 Hz (common for TTS)
-            segment = segment.set_channels(1)
-            segment = segment.set_frame_rate(22050)
-            
-            # Generate filename
-            filename = f"{file_base_name}_seg{idx:03d}.wav"
-            filepath = self.wav_dir / filename
-            
-            # Export as WAV
-            segment.export(str(filepath), format="wav")
-            segment_files.append(filepath)
-            
-        return segment_files
-    
-    def transcribe_segments(self, segment_files):
-        """
-        Transcribe audio segments using Whisper
-        """
-        transcriptions = []
-        
-        print(f"\nTranscribing {len(segment_files)} segments...")
-        for filepath in tqdm(segment_files):
-            result = self.model.transcribe(
-                str(filepath),
-                language="en",  # Change if needed
-                fp16=torch.cuda.is_available()
-            )
-            
-            transcriptions.append({
-                "audio_file": filepath.name,
-                "text": result["text"].strip(),
-                "duration": result.get("duration", 0)
-            })
-        
-        return transcriptions
-    
-    def process_all(self):
-        """
-        Process all audio files in input directory
-        """
-        # Support multiple audio formats
-        audio_files = []
-        for ext in ['*.m4a', '*.mp4a', '*.mp4', '*.mp3', '*.wav', '*.aac']:
-            audio_files.extend(list(self.input_dir.glob(ext)))
-        
-        if not audio_files:
-            print(f"No audio files found in {self.input_dir}")
-            return
-        
-        print(f"Found {len(audio_files)} audio files")
-        
-        all_transcriptions = []
-        
-        for audio_file in audio_files:
-            # Split audio into segments
-            segment_files = self.split_audio(audio_file)
-            
-            # Transcribe segments
-            transcriptions = self.transcribe_segments(segment_files)
-            all_transcriptions.extend(transcriptions)
-        
-        # Save transcriptions
-        self.save_transcriptions(all_transcriptions)
-        
-        print(f"\n✓ Processing complete!")
-        print(f"  Total segments: {len(all_transcriptions)}")
-        print(f"  WAV files: {self.wav_dir}")
-        print(f"  Transcripts: {self.output_dir}")
-    
-    def save_transcriptions(self, transcriptions):
-        """
-        Save transcriptions in multiple formats for TTS training
-        """
-        # Format 1: JSON (detailed)
-        json_path = self.output_dir / "transcriptions.json"
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(transcriptions, f, indent=2, ensure_ascii=False)
-        
-        # Format 2: CSV-like format (LJSpeech style)
-        metadata_path = self.output_dir / "metadata.csv"
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            for item in transcriptions:
-                # Format: filename|text
-                f.write(f"{item['audio_file']}|{item['text']}\n")
-        
-        # Format 3: Separate text files
-        txt_dir = self.output_dir / "transcripts"
-        txt_dir.mkdir(exist_ok=True)
-        
-        for item in transcriptions:
-            txt_file = txt_dir / f"{Path(item['audio_file']).stem}.txt"
-            with open(txt_file, 'w', encoding='utf-8') as f:
-                f.write(item['text'])
-        
-        print(f"\nSaved transcriptions:")
-        print(f"  - JSON: {json_path}")
-        print(f"  - Metadata CSV: {metadata_path}")
-        print(f"  - Individual txt: {txt_dir}")
+        # Whisper still loads on primary GPU (cuda:0)
+        self.transcribe_model = whisper.load_model("medium", device="cuda:0")
 
+    def separate_vocals(self):
+        print("🛠 Stage 1: Parallel AI Vocal Isolation (Dual-GPU & High Quality)...")
+        temp_chunks_dir = self.output_dir / "temp_chunks"
+        temp_out_dir = self.output_dir / "temp_out"
+        temp_chunks_dir.mkdir(parents=True, exist_ok=True)
 
-def main():
-    """
-    Main execution function
-    """
-    # Configuration
-    INPUT_DIR = "./audiofiles"     # Directory with your audio files
-    OUTPUT_DIR = "./tts_dataset"   # Output directory
-    MIN_DURATION = 7               # Minimum segment duration (seconds)
-    MAX_DURATION = 10              # Maximum segment duration (seconds)
-    
-    # Create processor and run
-    processor = AudioProcessor(
-        input_dir=INPUT_DIR,
-        output_dir=OUTPUT_DIR,
-        min_duration=MIN_DURATION,
-        max_duration=MAX_DURATION
-    )
-    
-    processor.process_all()
+        # Split into smaller 20-minute chunks to distribute work better
+        subprocess.run([
+            'ffmpeg', '-i', str(self.input_path), 
+            '-f', 'segment', '-segment_time', '1200', 
+            '-c', 'copy', str(temp_chunks_dir / "chunk_%03d.wav")
+        ], check=True, capture_output=True)
 
+        chunks = sorted(list(temp_chunks_dir.glob("*.wav")))
+        tasks = []
+        
+        # Distribute chunks between GPU 0 and GPU 1
+        for i, chunk in enumerate(chunks):
+            gpu_id = i % self.num_gpus
+            tasks.append((chunk, temp_out_dir, gpu_id))
+
+        # Run parallel processing
+        with multiprocessing.Pool(processes=self.num_gpus) as pool:
+            vocal_paths = list(tqdm(pool.imap(process_chunk_on_gpu, tasks), total=len(tasks), desc="Processing Chunks"))
+
+        print("🔗 Merging high-quality vocal chunks...")
+        final_vocal = self.output_dir / "vocals_final.wav"
+        list_file = self.output_dir / "concat_list.txt"
+        
+        with open(list_file, 'w') as f:
+            for p in vocal_paths:
+                f.write(f"file '{p.absolute()}'\n")
+
+        subprocess.run([
+            'ffmpeg', '-f', 'concat', '-safe', '0', 
+            '-i', str(list_file), '-c', 'copy', str(final_vocal)
+        ], check=True, capture_output=True)
+
+        shutil.rmtree(temp_chunks_dir)
+        return final_vocal
+
+    def process(self):
+        vocal_file = self.separate_vocals()
+        
+        print("🛠 Stage 2: Natural Segmentation...")
+        audio = AudioSegment.from_wav(vocal_file)
+        ranges = detect_nonsilent(audio, min_silence_len=500, silence_thresh=-45) # Lowered thresh for cleaner cuts
+        
+        results = []
+        print(f"🛠 Stage 3: Transcribing {len(ranges)} segments...")
+        
+        for idx, (start, end) in enumerate(tqdm(ranges)):
+            start = max(0, start - self.padding)
+            end = min(len(audio), end + self.padding)
+            
+            duration = end - start
+            if duration < self.min_dur: continue
+
+            if duration > self.max_dur:
+                end = start + self.max_dur
+
+            seg_name = f"{idx:04d}.wav"
+            seg_path = self.wav_dir / seg_name
+            
+            segment = audio[start:end].fade_in(50).fade_out(50)
+            segment.export(seg_path, format="wav")
+            
+            txt = self.transcribe_model.transcribe(str(seg_path))["text"].strip()
+            if len(txt) > 5:
+                results.append(f"{seg_name}|{txt}")
+
+        with open(self.output_dir / "metadata1.csv", "w", encoding="utf-8") as f:
+            f.write("\n".join(results))
+            
+        print(f"\n✅ Finished! Multi-GPU processing complete.")
 
 if __name__ == "__main__":
-    main()
-
-
-"""
-INSTALLATION INSTRUCTIONS:
---------------------------
-pip install pydub whisper torch torchaudio tqdm
-
-# For pydub to work, you also need ffmpeg:
-# Ubuntu/Debian: sudo apt-get install ffmpeg
-# macOS: brew install ffmpeg
-# Windows: Download from https://ffmpeg.org/
-
-USAGE:
-------
-1. Create a folder called 'input_audio' and put your .m4a files there
-2. Run: python audio_processor.py
-3. Output will be in 'tts_dataset' folder:
-   - tts_dataset/wavs/ : All WAV segments
-   - tts_dataset/metadata.csv : Training metadata
-   - tts_dataset/transcriptions.json : Detailed info
-   - tts_dataset/transcripts/ : Individual text files
-
-OUTPUT FORMAT:
---------------
-The metadata.csv follows LJSpeech format:
-filename.wav|Transcribed text here
-
-This is compatible with most TTS training frameworks like:
-- Coqui TTS
-- NVIDIA NeMo
-- ESPnet
-- Tacotron2
-- VITS
-"""
+    # Required for Windows multiprocessing
+    multiprocessing.freeze_support()
+    
+    FILE = r"D:\audioanalysis\audio_partsaigerace2.wav"
+    OUT = r"D:\audioanalysis\output_saigrace1"
+    processor = NaturalAIProcessor(FILE, OUT)
+    processor.process()
